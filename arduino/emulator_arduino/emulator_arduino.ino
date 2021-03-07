@@ -1,15 +1,18 @@
 //Arduino pins
-#define GBClock 8
-#define GBIn 10 //on the emulated device, out for the physical device
-#define GBOut 9 //on the emulated device, in for the physical device
+#define GBClock 2
+#define GBIn 4 //on the emulated device, out for the physical device
+#define GBOut 5 //on the emulated device, in for the physical device
 
 //states of incoming packets from Game Boy
+#define TIMEOUT 10
 #define IDLING 0
 #define PREAMBLE_PARTIAL 1
 #define HEADER 2
 #define DATASUM 3
 #define DATASUM_DONE 4
 #define RESPONSE_PARTIAL 5
+
+#define GB_TIMEOUT 150
 
 //clock status
 #define CLOCK_LOW 0
@@ -26,13 +29,21 @@ byte header_remain;
 int data_remain;
 unsigned long tick;
 
+unsigned long gb_tick;
+byte timed_out;
+
 byte GBSerialIO(byte tx_byte) {
   byte rx_byte=0;
   for (byte c=0;  c<8;  c++) {
 
     //read cycle - begins when clock is low
+    gb_tick = millis();
     while(digitalRead(GBClock) == 1){
-      continue;
+      if (millis() - gb_tick > GB_TIMEOUT){
+        packet_state = TIMEOUT;
+        timed_out = 1;
+        return 0x00;
+      }
     }
     rx_byte <<= 1;
     if(digitalRead(GBIn))
@@ -49,8 +60,12 @@ byte GBSerialIO(byte tx_byte) {
       digitalWrite(GBOut, 0);
     }   
 
+    gb_tick = millis();
     while(digitalRead(GBClock) == 0){
-      continue;
+      if (millis() - gb_tick > GB_TIMEOUT){
+        timed_out = 1;
+        return 0x00;
+      }
     }
   }
   return rx_byte;
@@ -72,6 +87,7 @@ void setup() {
   status = 0x00;
   Serial.begin(115200);
   tick = millis();
+  timed_out = 0x00;
 }
 
 void loop() {
@@ -93,11 +109,17 @@ void loop() {
 
   if (clock_status == CLOCK_LOW){
     clock_status = CLOCK_LOW_READ;
+    digitalWrite(LED_BUILTIN, LOW);
     rx_byte = GBSerialIO(tx_byte);
     tick = millis();
 
     switch (packet_state)
     {
+      case TIMEOUT:
+        tx_byte = 0x00;
+        packet_state = IDLING;
+        break;
+        
       case IDLING:
         tx_byte = 0x00;
         if (rx_byte==0x88) {
@@ -141,14 +163,15 @@ void loop() {
       case RESPONSE_PARTIAL:
         packet_state = IDLING;
         tx_byte = 0x00;
-        digitalWrite(LED_BUILTIN, LOW);
         break;
     }
     
     Serial.write(rx_byte);
     Serial.write(tx_byte);
     Serial.write(packet_state);
-    Serial.write(data_remain);
+    Serial.write(timed_out);
+
+    timed_out = 0x00;
   }
 
   if (millis() - tick > 1500) {
@@ -163,8 +186,6 @@ void loop() {
   }
   if (packet_state == IDLING){
     digitalWrite(LED_BUILTIN, HIGH);
-  } else {
-    digitalWrite(LED_BUILTIN, LOW);
   }
 
   //Serial.write(clock_status+69);

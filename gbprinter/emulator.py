@@ -1,10 +1,11 @@
 from . import image
 import serial
-from time import sleep
+from time import sleep, time
 import platform
 import logging
 from enum import Enum
 from collections import defaultdict
+import glob
 
 CHECKSUM_ERROR = 0
 PRINTING = 1
@@ -31,6 +32,8 @@ class Emulator:
                 sleep(2)
             self.init_buffer()
             self._fullimage = b''
+            self.print_partial = False
+            self.last_byte_time = 0
 
         def init_buffer(self):
             self._status = b'\x00'
@@ -87,7 +90,7 @@ class Emulator:
                 self.gbp_serial = serial.Serial(port,baudrate=115200,timeout=.2)
                 self.logger.info('checking port ' + port)
                 sleep(2)
-                self.gbp_serial.write(bytes([105]))
+                self.gbp_serial.write(bytes([0x69]))
                 response = self.gbp_serial.read(4)
                 if response == b'nice':
                     best_port = port
@@ -101,14 +104,24 @@ class Emulator:
                 self.logger.info('Arduino found on port ' + best_port)
 
         def get_gb_data(self):
-            packet = self.current_packet
             from_gb = self.gbp_serial.read(4)
             if from_gb:
-                rx,tx,ard_state,data_remain = from_gb     
-                packet.add_byte(rx)
-                if packet.status == Status.COMPLETE:
-                    self.handle_packet(packet)
+                rx,tx,ard_state,timedout = from_gb
+                if int(timedout) == 1:
+                    self.logger.warning('Timeout on last byte, returning to init status')
                     self.current_packet = Packet()
+                    self.init_buffer()
+                self.current_packet.add_byte(rx)
+                self.logger.debug(f'Received byte {hex(rx)}')
+                if self.current_packet.status == Status.COMPLETE:
+                    self.handle_packet(self.current_packet)
+                    self.current_packet = Packet()
+                    # self.last_byte_time = 0
+            else:
+                if self.current_packet.status != Status.EMPTY:
+                    self.logger.warning('Timeout on last packet, returning to init status')
+                self.current_packet = Packet()
+                self.init_buffer()
 
         def handle_packet(self,packet):
             self.logger.info('Packet received, type {}, data size {}'.format(packet.type,packet.data_size))
@@ -126,13 +139,14 @@ class Emulator:
                 self.set_status(UNPROCESSED_DATA,False)
                 end_margin = packet.data[1] % 16
                 self._fullimage += self._buffer
-                image_mat = image.gb_tile_to_matrix(self._fullimage)
-                image_obj = image.matrix_to_image(image_mat,save=True,palette=self.palette)
                 if end_margin != 0:
-                    self.logger.info('Full image sent!')
+                    self.logger.info('Full image received!')
+                    image.gbtile_to_image(self._fullimage,save=True,palette=self.palette)
                     self._fullimage = b''
                 else:
-                    self.logger.info('Partial image sent!')
+                    self.logger.info('Partial image received!')
+                    if self.print_partial:
+                        image.gbtile_to_image(self._fullimage,save=True,palette=self.palette)
 
 
             elif packet.type == 4: #data

@@ -240,3 +240,11 @@ def image_to_gbtile(image,dither_mode='bayer',rotate='auto',align='center'):
     gb_tiles = twobit_to_gbtile(twobit)
 
     return gb_tiles
+
+def gbtile_to_image(gbtile,palette='gray',save=False):
+    """
+    Full conversion from gbtile to an image object. Optionally aves it
+    """
+    image_mat = gbtile_to_twobit(gbtile)
+    image_obj = twobit_to_image(image_mat,save=True,palette=palette)
+    return image_obj
