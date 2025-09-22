@@ -47,6 +47,7 @@ class Controller:
             self.logger.info('checking port ' + port)
             sleep(2)
             response = self.cmd_status()
+            print(f"Recived {response}")
             if response[0] in [0x80,0x81]:
                 best_port = port
                 break

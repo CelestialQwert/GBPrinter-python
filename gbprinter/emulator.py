@@ -1,11 +1,11 @@
 from . import image
+
 import serial
-from time import sleep, time
+import time
 import platform
 import logging
-from enum import Enum
-from collections import defaultdict
 import glob
+from collections import defaultdict
 
 CHECKSUM_ERROR = 0
 PRINTING = 1
@@ -16,34 +16,147 @@ PAPER_JAM = 5
 OTHER_ERROR = 6
 LOW_BATTERY = 7
 
+status_text = [
+    'CHECKSUM_ERROR',
+    'PRINTING',
+    'IMAGE_FULL',
+    'UNPROCESSED_DATA',
+    'PACKET_ERROR',
+    'PAPER_JAM',
+    'OTHER_ERROR',
+    'LOW_BATTERY'
+]
+
+
+NULL = 0
+INIT = 1
+PRINT = 2
+DATA = 4
+BREAK = 8
+STATUS = 0xF
+
+def unknown(): return 'UNKNOWN'
+p_type = defaultdict(unknown)
+p_type[0] = 'NULL'
+p_type[1] = 'INIT'
+p_type[2] = 'PRINT'
+p_type[4] = 'DATA'
+p_type[8] = 'BREAK'
+p_type[0xF] = 'STATUS'
+
+log = logging.getLogger(__name__)
+
+class GBSerial:
+    def __init__(self, port=None):
+        self.log = logging.getLogger('gbserial')
+        self.port = None
+        self.serial = None
+
+    def init(self):
+        if self.serial:
+            return
+        if self.port is None:
+            good_ports = self.find_serial_ports()
+        else:
+            self.log.info(f'Printer on {port} you say?')
+            good_ports = [self.port]
+        self.log.debug(f'Good ports are {",".join(good_ports)}')
+        for port in good_ports:
+            ret = self.test_port(port)
+            if ret:
+                self.log.info(f'Printer dongle found on {port}')
+                self.serial = ret
+                self.port = port
+                break
+        else:
+            raise IOError(f'Printer dongle not found on ports {",".join(good_ports)}')
+        return self
+
+    @staticmethod
+    def find_serial_ports():
+        opsys = platform.system()
+        if opsys == 'Windows':
+            ports = ['COM%s' % (i + 1) for i in range(2,256)]
+        elif opsys == 'Linux':
+            ports = glob.glob('/dev/tty[A-Za-z]*')
+        elif opsys == 'Darwin':
+            ports = glob.glob('/dev/tty.*')
+        else:
+            raise EnvironmentError('Not Windows, Mac, or Linux, dunno ' \
+                                   'where your serial ports would be')
+        good_ports = []
+        for port in ports:
+            try:
+                s = serial.Serial(port)
+                s.close()
+                good_ports.append(port)
+            except (OSError, serial.SerialException):
+                pass
+        return good_ports
+
+    @staticmethod
+    def test_port(port):
+        test_serial = serial.Serial(port, baudrate=115200, timeout=0)
+        log.info(f'Checking port {port}')
+        time.sleep(2)
+        response = test_serial.read(9999)
+        if b'GAMEBOY PRINTER Packet Capture' in response:
+            return test_serial
+        else:
+            test_serial.close()
+            return None
+
+    def get_line(self, timeout=1):
+        start = time.time()
+        serial_buffer = bytearray()
+        while True:
+            from_gb = self.serial.read()
+            if from_gb:
+                serial_buffer.append(int.from_bytes(from_gb, 'big'))
+                if from_gb == b'\n':
+                    log.debug('Line received from serial')
+                    break
+            if time.time() - start > timeout:
+                log.debug('Timeout from serial')
+                break
+        return serial_buffer.strip()
+
+    def shutdown(self):
+        self.serial.close()
+
 class Emulator:
-
-        def __init__(self,port=None,palette=image.PALETTES['gray']):
-            self.logger = logging.getLogger(__name__)
+        def __init__(self, port=None, palette=image.PALETTES['gray'], print_partial=False):
+            self.log = logging.getLogger('Emulator')
             self.palette = palette
-            self.current_packet = Packet()
-
-            if port == None:
-                self.find_serial()
-            else:
-                self.logger.info('Printer on {} you say?'.format(port))
-                self.gbp_serial = serial.Serial(port,baudrate=115200,timeout=.2)
-                self.logger.info('sleep for 2 seconds to prep serial...')
-                sleep(2)
             self.init_buffer()
-            self._fullimage = b''
-            self.print_partial = False
-            self.last_byte_time = 0
+            self.running = False
+            self.print_partial = print_partial
+
+        def init(self, source=None):
+            self.log.info('Begin to init')          
+            self.source = source if source else GBSerial()
+            self.source.init()
+            self._fullimage = bytearray()
+            self.running = True
+            self.log.info('Emulator is init')
+
+        def shutdown(self):
+            self.source.shutdown()
+            self.running = False
 
         def init_buffer(self):
             self._status = b'\x00'
-            self._buffer = b''
-            self._print_fake = 0
+            self._buffer = bytearray()
+            # self._fullimage = bytearray()
 
         @property
         def status(self):
             return [self._status[0]>>i & 0x01 for i in range(8)]
 
+        @property
+        def status_text(self):
+            return [status_text[i] for i in range(8)if self._status[0]>>i & 0x01]
+        
         @property
         def state(self):
             return self._state
@@ -52,7 +165,7 @@ class Emulator:
         def pages(self):
             return len(self._buffer)//640
         
-        def set_status(self,bit,new_status=True):
+        def set_status(self, bit, new_status=True):
             num = self._status[0]
             if new_status:
                 num |= 2**bit
@@ -62,282 +175,204 @@ class Emulator:
 
         def get_status(self,bit):
             return bool(self._status[0] & 2**bit)
-        
-        def find_serial(self):
-            opsys = platform.system()
-            if opsys == 'Windows':
-                ports = ['COM%s' % (i + 1) for i in range(2,256)]
-            elif opsys == 'Linux':
-                ports = glob.glob('/dev/tty[A-Za-z]*')
-            elif opsys == 'Darwin':
-                ports = glob.glob('/dev/tty.*')
-            else:
-                raise EnvironmentError('Not Windows, Mac, or Linux, dunno where your serial ports would be')
 
-            good_ports = []
-            for port in ports:
-                try:
-                    s = serial.Serial(port)
-                    s.close()
-                    good_ports.append(port)
-                except (OSError, serial.SerialException):
+        def get_line(self):
+            if self.running:
+                return self.source.get_line()
+            else:
+                print('Did not init emulator')
+
+        def run_forever(self):
+            while True:
+                self.run_once()
+
+        def run_once(self):
+            line = self.source.get_line()
+            packet = self.parse_line(line)
+            if packet:
+                ret = self.handle_packet(packet)
+                log.debug(f'Current status: {self.status_text}')
+                log.debug(f'Status according to Arduino: {packet.status_text}')
+                return ret
+
+
+        def parse_line(self, data):
+            # log.debug('Full line from serial:')
+            # log.debug(data.decode('utf-8'))
+            if not data.startswith(b'88 33 '):
+                log.debug('Not a proper packet')
+                return
+            data_split = data.split(b' ')
+            data_hex = [int(x, 16) for x in data_split]
+            p = GBPacket(data_hex)
+            return p
+
+        def handle_packet(self, packet):
+            log.info(f'Received {packet}')
+            log.info(packet.raw_data)
+            if packet.is_valid() != 'VALID':
+                log.info(f'Packet is invalid: {packet.is_valid()}')
+                return  
+
+            if packet.command == INIT:
+                self.handle_init(packet)
+            elif packet.command == PRINT:
+                return self.handle_print(packet)
+            elif packet.command == DATA:
+                self.handle_data(packet)
+            elif packet.command == BREAK:
+                self.handle_break(packet)
+            elif packet.command == STATUS:
+                self.handle_status(packet)
+            else:
+                log.error('How did you get here?')
+
+        def handle_init(self, packet):
+            # if not self.get_status(PRINTING): #if not currently printing
+            self.init_buffer()
+
+        def handle_print(self, packet):
+            log.debug('Print data 0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x}'.format(*packet.data))
+            self.set_status(PRINTING)
+            self.set_status(IMAGE_FULL)
+            self.set_status(UNPROCESSED_DATA, False)
+            end_margin = packet.data[1] % 16
+            self._fullimage += self._buffer
+            if end_margin != 0:
+                log.info('Full image received!')
+                ret = image.gbtile_to_image(self._fullimage, palette=self.palette, save=True)
+                self._fullimage = bytearray()
+                return ret
+            else:
+                log.info('Partial image received!')
+                if self.print_partial:
+                    return image.gbtile_to_image(self._fullimage, palette=self.palette, save=True)
+
+        def handle_data(self, packet):
+            if not self.get_status(PRINTING):
+                if len(packet.data) == 0:
                     pass
-
-            self.logger.info('good ports are ' + ','.join(good_ports))
-
-            best_port = None
-            for port in good_ports:
-                self.gbp_serial = serial.Serial(port,baudrate=115200,timeout=.2)
-                self.logger.info('checking port ' + port)
-                sleep(2)
-                self.gbp_serial.write(bytes([0x69]))
-                response = self.gbp_serial.read(4)
-                if response == b'nice':
-                    best_port = port
-                    break
+                elif self.pages >= 9:
+                    log.warning("Buffer full, data packet rejected")
+                    self.set_status(PACKET_ERROR)
                 else:
-                    self.gbp_serial.close()
+                    if packet.compressed:
+                        data = packet.decompress_data()
+                    else:
+                        data = packet.data
+                    self._buffer += bytes(data)
+                    self.set_status(UNPROCESSED_DATA)
+                log.debug('Number of pages in buffer: {}'.format(self.pages))
+                log.debug('Number of bytes in buffer: {}'.format(len(self._buffer)))
 
-            if best_port == None:
-                raise IOError("Can't find Arduino!")
-            else:
-                self.logger.info('Arduino found on port ' + best_port)
-
-        def get_gb_data(self):
-            from_gb = self.gbp_serial.read(4)
-            if from_gb:
-                rx,tx,ard_state,timedout = from_gb
-                if int(timedout) == 1:
-                    self.logger.warning('Timeout on last byte, returning to init status')
-                    self.current_packet = Packet()
-                    self.init_buffer()
-                self.current_packet.add_byte(rx)
-                self.logger.debug(f'Received byte {hex(rx)}')
-                if self.current_packet.status == Status.COMPLETE:
-                    self.handle_packet(self.current_packet)
-                    self.current_packet = Packet()
-                    # self.last_byte_time = 0
-            else:
-                if self.current_packet.status != Status.EMPTY:
-                    self.logger.warning('Timeout on last packet, returning to init status')
-                self.current_packet = Packet()
+        def handle_break(self, packet):
+            if self.get_status(PRINTING):
                 self.init_buffer()
 
-        def handle_packet(self,packet):
-            self.logger.info('Packet received, type {}, data size {}'.format(packet.type,packet.data_size))
-            if packet.data_size == 4:
-                self.logger.debug('Print data 0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x}'.format(*packet.data))
-            #self.logger.debug('Checksum is {}'.format(self.current_packet.verify_checksum()))
-
-            if packet.type == 1: #init
-                if not self.get_status(1): #if not currently printing
-                    self.init_buffer()
-
-            elif packet.type == 2: #print
-                self.set_status(PRINTING)
-                self.set_status(IMAGE_FULL)
-                self.set_status(UNPROCESSED_DATA,False)
-                end_margin = packet.data[1] % 16
-                self._fullimage += self._buffer
-                if end_margin != 0:
-                    self.logger.info('Full image received!')
-                    image.gbtile_to_image(self._fullimage,save=True,palette=self.palette)
-                    self._fullimage = b''
+        def handle_status(self, packet):
+            if self.get_status(PRINTING):
+                if not self.get_status(UNPROCESSED_DATA):
+                    self.set_status(UNPROCESSED_DATA)
                 else:
-                    self.logger.info('Partial image received!')
-                    if self.print_partial:
-                        image.gbtile_to_image(self._fullimage,save=True,palette=self.palette)
-
-
-            elif packet.type == 4: #data
-                if not self.get_status(1): #if not currently printing
-                    if packet.data_size == 0:
-                        pass
-                    elif self.pages >= 9:
-                        self.set_status(PACKET_ERROR)
-                    else:
-                        if packet.header[1]: #if compression
-                            data = self.decompress(packet.data)
-                        else:
-                            data = packet.data
-                        self._buffer = self._buffer + bytes(data)
-                        self.set_status(UNPROCESSED_DATA)
-                    self.logger.debug('Number of pages in buffer: {}'.format(self.pages))
-                    self.logger.debug('Number of bytes in buffer: {}'.format(len(self._buffer)))
-
-            elif packet.type == 8: #break
-                if self.get_status(PRINTING):
+                    self.set_status(PRINTING,False)
+                    self.set_status(IMAGE_FULL,False)
+                    self.set_status(UNPROCESSED_DATA,False)
                     self.init_buffer()
 
-            elif packet.type == 15: #status
-                if self.get_status(PRINTING):
-                    self._print_fake += 1
-                    if self._print_fake == 5:
-                        self.set_status(UNPROCESSED_DATA)
-                    if self._print_fake > 10:
-                        self.set_status(PRINTING,False)
-                        self.set_status(IMAGE_FULL,False)
-                        self.set_status(UNPROCESSED_DATA,False)
-                        self.init_buffer()
 
-            self.gbp_serial.write(self._status)
-            self.logger.debug('My status is: {}'.format(self.status))
+class GBPacket:
+    def __init__(self, data):
+        self.raw_data = data
+        self.magic = data[0:2]
+        self.command = data[2]
+        self.compressed = bool(data[3])
+        self.data_length = data[4] + data[5]*256
+        self.data = data[6:6+self.data_length]
+        self.checksum = data[-4] + data[-3]*256
+        self.response = data[-2]
+        self._status = data[-1]
+        self.valid = None
+        self.calc_sum = None
 
-        def decompress(self,comp_data):
-            len_comp = len(comp_data)
-            raw_data = [0]*640
-            comp_offset = 0
-            raw_offset = 0
-            while comp_offset < len(comp_data):
-                command_byte = comp_data[comp_offset]
-                comp_offset += 1
-                if command_byte & 0x80: #compressed run
-                    length = command_byte - 0x80 + 2
-                    duped_byte = comp_data[comp_offset]
-                    comp_offset += 1
-                    raw_data[raw_offset:raw_offset+length] = [duped_byte]*length
-                    raw_offset += length
-                else: #uncompressed run
-                    length = command_byte + 1
-                    unduped_data = comp_data[comp_offset:comp_offset+length]
-                    comp_offset += length
-                    raw_data[raw_offset:raw_offset+length] = unduped_data
-                    raw_offset += length
-            return raw_data
+    def is_valid(self):
+        if self.valid is None:
+            self.valid = self._check_validity()
+        return self.valid
 
-
-class Status(Enum):
-    EMPTY = 0
-    PREAMBLE_PARTIAL = 1
-    PREAMBLE_DONE = 2
-    HEADER_PARTIAL = 3
-    HEADER_DONE = 4
-    DATA_PARTIAL = 5
-    DATA_DONE = 6
-    CHECKSUM_PARTIAL = 7
-    CHECKSUM_DONE = 8
-    RESPONSE_PARTIAL = 9
-    COMPLETE = 10
-
-def unknown(): return 'UNKNOWN'
-
-p_type = defaultdict(unknown)
-p_type[0] = 'NULL'
-p_type[1] = 'INIT'
-p_type[2] = 'PRINT'
-p_type[4] = 'DATA'
-p_type[8] = 'BREAK'
-p_type[0xF] = 'STATUS'
-
-
-class Packet:
-    def __init__(self):
-        if not hasattr(self, 'logger'):
-            self.logger = logging.getLogger(__name__)
-        self._raw_data = [0]*10 # size of a dataless packet
-        self._status = Status.EMPTY
-        self._bytes_stored = 0
-        self._checksum = 0
-
-    @property
-    def raw_data(self):
-        return self._raw_data
+    def _check_validity(self):
+        if self.magic != [0x88, 0x33]:
+            return 'BAD_MAGIC_BYTES'
+        if self.command_text == 'UNKNOWN':
+            return 'BAD_COMMAND'
+        if not self.calc_sum:
+            self.calc_sum = sum(self.raw_data[2:-4])%(256**2)
+        if self.calc_sum != self.checksum:
+            return 'BAD_CHECKSUM'
+        return 'VALID'
 
     @property
     def status(self):
-        return self._status
+        return [self._status>>i & 0x01 for i in range(8)]
 
     @property
-    def header(self):
-        return self._raw_data[2:6]
+    def status_text(self):
+        return [status_text[i] for i in range(8)if self._status>>i & 0x01]
+
+    @property
+    def command_text(self):
+        return p_type[self.command]
     
-    @property
-    def data(self):
-        return self._raw_data[6:6+self.data_size]
+    # def decompress_data(self):
+    #     return self._decompress_data(self.data)
 
-    @property
-    def checksum(self):
-        return sum(self._raw_data[2:6+self.data_size]) % (256*256)
-    
-    @property
-    def rx_checksum(self):
-        return self._raw_data[-4] + self._raw_data[-3]*256
-
-    @property
-    def data_size(self):
-        return self._raw_data[4] + self._raw_data[5]*256
-
-    @property
-    def type(self):
-        return self._raw_data[2]
-
-    @property
-    def type_text(self):
-        return p_type[self._raw_data[2]]
-     
-
-    def verify_checksum(self):
-        return self.checksum == self.rx_checksum
-
-    def _raw_add_byte(self,byte):
-        if self._bytes_stored >= len(self._raw_data):
-            raise ValueError('Packet cannot accept more bytes (raw)')
-        self._raw_data[self._bytes_stored] = byte
-        self._bytes_stored += 1
-    
-    def add_bytes(self,*bytes):
-        for byte in bytes:
-            self.add_byte(byte)
-
-    def add_byte(self,rx):
-        if self._status == [Status.COMPLETE]:
-            raise ValueError('Packet cannot accept more bytes')
-
-        if self._status == Status.EMPTY:
-            if rx == 0x88:
-                self._raw_add_byte(rx)
-                self._status = Status.PREAMBLE_PARTIAL
-
-        elif self._status == Status.PREAMBLE_PARTIAL:
-            if rx == 0x33:
-                self._raw_add_byte(rx)
-                self._status = Status.PREAMBLE_DONE
+    @staticmethod
+    def _decompress_data(data):
+        raw_data = []
+        comp_idx = 0
+        while comp_idx < len(data):
+            comp_byte = data[comp_idx]
+            if comp_byte & 0x80:
+                run = 2 + comp_byte - 0x80
+                repeat_byte = data[comp_idx+1]
+                raw_data.extend([repeat_byte]*run)
+                comp_idx += 2
             else:
-                self.__init__()
+                run = 1 + comp_byte
+                raw_data.extend(data[comp_idx:comp_idx+run])
+                comp_idx += run + 1
+        return raw_data
 
-        elif self._status in [Status.PREAMBLE_DONE,Status.HEADER_PARTIAL]:
-            self._status = Status.HEADER_PARTIAL
-            self._raw_add_byte(rx)
-            if self._bytes_stored >= 6: #header is done
-                if self.data_size == 0:
-                    self._status = Status.DATA_DONE
-                else:
-                    temp_data = self._raw_data
-                    self._raw_data = [0]*(10+self.data_size)
-                    self._raw_data[0:6] = temp_data[0:6]
-                    self._status = Status.HEADER_DONE
-
-        elif self._status in [Status.HEADER_DONE,Status.DATA_PARTIAL]:
-            self._status = Status.DATA_PARTIAL
-            self._raw_add_byte(rx)
-            if self._bytes_stored >= 6 + self.data_size:
-                self._status = Status.DATA_DONE
-
-        elif self._status == Status.DATA_DONE:
-            self._raw_add_byte(rx)
-            self._status = Status.CHECKSUM_PARTIAL
-
-        elif self._status == Status.CHECKSUM_PARTIAL:
-            self._raw_add_byte(rx)
-            self._status = Status.CHECKSUM_DONE
-
-        elif self._status == Status.CHECKSUM_DONE:
-            self._raw_add_byte(rx)
-            self._status = Status.RESPONSE_PARTIAL
-
-        elif self._status == Status.RESPONSE_PARTIAL:
-            self._raw_add_byte(rx)
-            self._status = Status.COMPLETE
+    def decompress_data(self, comp_data=None):
+        if comp_data is None:
+            comp_data = self.data
+        len_comp = len(comp_data)
+        raw_data = [0]*640
+        comp_offset = 0
+        raw_offset = 0
+        while comp_offset < len(comp_data):
+            command_byte = comp_data[comp_offset]
+            comp_offset += 1
+            if command_byte & 0x80: #compressed run
+                length = command_byte - 0x80 + 2
+                duped_byte = comp_data[comp_offset]
+                comp_offset += 1
+                raw_data[raw_offset:raw_offset+length] = [duped_byte]*length
+                raw_offset += length
+            else: #uncompressed run
+                length = command_byte + 1
+                unduped_data = comp_data[comp_offset:comp_offset+length]
+                comp_offset += length
+                raw_data[raw_offset:raw_offset+length] = unduped_data
+                raw_offset += length
+        return raw_data
 
 
-        
+        return self.data
+
+    def __str__(self):
+        return f'GBPacket(command={self.command_text}, ' \
+               f'compressed={self.compressed}, ' \
+               f'data_length={self.data_length})'
+
+    def __repr__(self):
+        return f'GBPacket({self.raw_data})'

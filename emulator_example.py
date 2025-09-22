@@ -4,7 +4,6 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-emu = emulator.Emulator(palette = 'gray')
-
-while True:
-    emu.get_gb_data()
+emu = emulator.Emulator()
+emu.init()
+emu.run_forever()

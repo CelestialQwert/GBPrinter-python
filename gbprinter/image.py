@@ -2,6 +2,7 @@ from PIL import Image
 import time
 import numpy as np
 import math
+from pathlib import Path
 
 def gray_resize(in_image,rotate='auto',align='center'):
     """
@@ -97,6 +98,13 @@ def nearest_color(image):
         image = np.array(image)
     return 85 * np.round(image/85).astype(np.uint8)
 
+def nearest_color_hack(image):
+    if type(image) == type(Image.new('RGB',(1,1))):
+        image = np.array(image)
+    image[image==128] = 85
+    image[image==192] = 170
+    return image
+
 class DitherFactory:
     def __init__(self):
         self._modes = {}
@@ -118,6 +126,7 @@ dither_factory = DitherFactory()
 dither_factory.register('bayer',bayer)
 dither_factory.register('equalbins',equal_bins)
 dither_factory.register('nearest',nearest_color)
+dither_factory.register('nearhack',nearest_color_hack)
 
 def dither(image,mode='bayer'):
     """
@@ -161,7 +170,8 @@ def twobit_to_gbtile(arr):
 
 #black, darkgray, lightgray, white
 PALETTES = {
-    'gray': ('000000','555555','AAAAAA','FFFFFF'),
+    'gray': ('000000','808080','C0C0C0','FFFFFF'),
+    'gray_even': ('000000','555555','AAAAAA','FFFFFF'),
     'gbcamera' : ('000000','0063C5','7BFF31','FFFFFF'),
     'gbred': ('000000','943A3A','FF8484','FFFFFF'),
     'gborange': ('000000','843100','FFAD63','FFFFFF'),
@@ -197,10 +207,11 @@ def twobit_to_image(arr,palette='gray',save=False):
         image.putpalette(palette_convert(palette))
     else:
         image.putpalette(palette_convert(PALETTES[palette]))
-        
+    img_path = None 
     if save:
-        image.save(time.strftime('gbp_out/gbp_%Y%m%d_%H%M%S.png'),'PNG')
-    return image
+        img_path = Path(time.strftime('gbp_out/gbp_%Y%m%d_%H%M%S.png'))
+        image.save(img_path, 'PNG', dpi=(60,60))
+    return (image, img_path)
 
 def gbtile_to_twobit(gbtile_bytes):
     """
@@ -246,5 +257,5 @@ def gbtile_to_image(gbtile,palette='gray',save=False):
     Full conversion from gbtile to an image object. Optionally aves it
     """
     image_mat = gbtile_to_twobit(gbtile)
-    image_obj = twobit_to_image(image_mat,save=True,palette=palette)
+    image_obj = twobit_to_image(image_mat,save=save,palette=palette)
     return image_obj
